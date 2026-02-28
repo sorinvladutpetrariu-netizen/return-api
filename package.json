@@ -11,7 +11,8 @@
     "ios": "expo start --ios",
     "web": "expo start --web",
     "lint": "expo lint",
-    "seed": "tsx server/seed.ts"
+    "seed": "tsx server/seed.ts",
+    "migrate": "drizzle-kit push"
   },
   "dependencies": {
     "@expo/vector-icons": "^15.0.3",
