@@ -1,7 +1,7 @@
 {
   "name": "wisdom-hub",
   "version": "1.0.0",
-  "type": "module"
+  "type": "module",
   "scripts": {
     "start": "npm run build && node dist/index.js",
     "dev": "npx tsx server/index.ts",
