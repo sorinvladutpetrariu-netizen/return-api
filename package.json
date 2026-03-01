@@ -1,6 +1,5 @@
 {
   "name": "wisdom-hub",
-  "main": "expo-router/entry",
   "version": "1.0.0",
   "type": "module"
   "scripts": {
