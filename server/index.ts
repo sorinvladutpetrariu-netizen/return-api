@@ -13,6 +13,13 @@ import { users } from "./db/schema";
 const app: Express = express();
 const PORT = Number(process.env.PORT) || 3000;
 
+/* ================= IMPORTANT FOR RAILWAY / PROXIES ================= */
+/**
+ * Railway seteaza X-Forwarded-For. Daca nu setezi trust proxy,
+ * express-rate-limit poate arunca ERR_ERL_UNEXPECTED_X_FORWARDED_FOR.
+ */
+app.set("trust proxy", 1);
+
 /* ================= ENV VALIDATION ================= */
 
 if (!process.env.JWT_SECRET) {
@@ -24,23 +31,41 @@ if (!process.env.DATABASE_URL) {
   process.exit(1);
 }
 
-/* ================= IMPORTANT FOR RAILWAY / PROXIES ================= */
-/**
- * Railway pune X-Forwarded-For. Daca nu setezi trust proxy,
- * express-rate-limit poate arunca ERR_ERL_UNEXPECTED_X_FORWARDED_FOR.
- */
-app.set("trust proxy", 1);
-
 /* ================= CONFIG ================= */
 
 const JWT_SECRET = process.env.JWT_SECRET as string;
 
-// Stripe: NU crapa daca lipseste cheia (doar dezactiveaza billing)
+// Stripe: nu crapa daca lipseste cheia (doar dezactiveaza billing)
 const STRIPE_SECRET_KEY = (process.env.STRIPE_SECRET_KEY || "").trim();
 const stripe =
   STRIPE_SECRET_KEY && STRIPE_SECRET_KEY.startsWith("sk_")
     ? new Stripe(STRIPE_SECRET_KEY, { apiVersion: "2023-10-16" })
     : null;
+console.log(
+  `[Stripe env] mode=${process.env.STRIPE_SECRET_KEY?.startsWith("sk_test_") ? "test" : "live"} ` +
+  `key=${process.env.STRIPE_SECRET_KEY ? "set" : "missing"} ` +
+  `price=${process.env.STRIPE_PRICE_ID ? "set" : "missing"} ` +
+  `webhook=${process.env.STRIPE_WEBHOOK_SECRET ? "set" : "missing"}`
+);
+
+/**
+ * DIAGNOSTIC Stripe env (fara sa expunem cheia completa)
+ * - confirma daca rulezi in test/live
+ * - confirma daca STRIPE_PRICE_ID / STRIPE_WEBHOOK_SECRET sunt setate
+ */
+const stripeMode =
+  STRIPE_SECRET_KEY.startsWith("sk_live_")
+    ? "live"
+    : STRIPE_SECRET_KEY.startsWith("sk_test_")
+      ? "test"
+      : stripe
+        ? "unknown"
+        : "missing";
+
+const stripeKeyLast4 = STRIPE_SECRET_KEY ? STRIPE_SECRET_KEY.slice(-4) : "----";
+console.log(
+  `[Stripe env] mode=${stripeMode} key=****${stripeKeyLast4} price=${process.env.STRIPE_PRICE_ID ? "set" : "missing"} webhook=${process.env.STRIPE_WEBHOOK_SECRET ? "set" : "missing"}`,
+);
 
 if (!stripe) {
   console.warn("⚠️ STRIPE_SECRET_KEY missing/invalid -> billing disabled");
@@ -78,8 +103,12 @@ interface AuthRequest extends Request {
 /* ================= AUTH MIDDLEWARE ================= */
 
 const verifyToken = (req: AuthRequest, res: Response, next: NextFunction) => {
-  const token = req.headers.authorization?.split(" ")[1];
-  if (!token) return res.status(401).json({ error: "No token provided" });
+  const header = req.headers.authorization || "";
+  const [scheme, token] = header.split(" ");
+
+  if (scheme !== "Bearer" || !token) {
+    return res.status(401).json({ error: "No token provided" });
+  }
 
   try {
     const decoded = jwt.verify(token, JWT_SECRET) as { id: string; email: string };
@@ -116,7 +145,7 @@ app.get("/debug/db-status", verifyToken, async (_req, res) => {
 
     let counts = { users: 0 };
     if (tableCheck.rows[0]?.exists === true) {
-      const userCount = await pool.query('SELECT COUNT(*) AS count FROM users');
+      const userCount = await pool.query("SELECT COUNT(*) AS count FROM users");
       counts.users = parseInt(userCount.rows[0]?.count ?? "0", 10);
     }
 
