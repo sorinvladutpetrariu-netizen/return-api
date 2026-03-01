@@ -3,12 +3,12 @@ import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import { eq } from 'drizzle-orm';
-import express, { Express, Request, Response, NextFunction } from 'express';
+import express, { Express, NextFunction, Request, Response } from 'express';
 import jwt from 'jsonwebtoken';
 import Stripe from 'stripe';
 
 import { db, pool } from './db/index';
-import { users, subscriptions, books } from './db/schema';
+import { users } from './db/schema';
 
 const app: Express = express();
 const PORT = Number(process.env.PORT) || 3000;
@@ -16,78 +16,72 @@ const PORT = Number(process.env.PORT) || 3000;
 /* ================= ENV VALIDATION ================= */
 
 if (!process.env.DATABASE_URL) {
-  console.error("❌ DATABASE_URL missing");
+  console.error('❌ DATABASE_URL missing');
   process.exit(1);
 }
 
 if (!process.env.JWT_SECRET) {
-  console.error("❌ JWT_SECRET missing");
+  console.error('❌ JWT_SECRET missing');
   process.exit(1);
-}
-
-if (!process.env.STRIPE_WEBHOOK_SECRET) {
-  console.warn("⚠️ STRIPE_WEBHOOK_SECRET missing");
 }
 
 /* ================= CONFIG ================= */
 
 const JWT_SECRET = process.env.JWT_SECRET as string;
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '', {
-  apiVersion: '2023-10-16',
-});
+// IMPORTANT for Railway / any proxy (fix express-rate-limit crash)
+app.set('trust proxy', 1);
 
-/* ================= SECURITY ================= */
+// Stripe optional (do NOT crash server if missing)
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
+const stripe = STRIPE_SECRET_KEY
+  ? new Stripe(STRIPE_SECRET_KEY, { apiVersion: '2023-10-16' })
+  : null;
+
+if (!STRIPE_SECRET_KEY) {
+  console.warn('⚠️ STRIPE_SECRET_KEY missing (billing endpoints will be disabled)');
+}
+
+/* ================= SECURITY MIDDLEWARE ================= */
 
 app.use(helmet());
 
-app.use(cors({
-  origin: true,
-  credentials: true
-}));
+app.use(
+  cors({
+    origin: true,
+    credentials: true,
+  }),
+);
 
 app.use(express.json({ limit: '1mb' }));
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 50,
-  message: { error: "Too many requests. Try again later." },
+  message: { error: 'Too many requests. Try again later.' },
 });
 
 app.use('/auth', authLimiter);
 
 /* ================= AUTH MIDDLEWARE ================= */
 
-function requireAuth(req: any, res: any, next: NextFunction) {
-  const authHeader = req.headers.authorization;
-  if (!authHeader) return res.status(401).json({ error: "Unauthorized" });
+interface AuthRequest extends Request {
+  user?: { id: string; email: string };
+}
 
-  const token = authHeader.split(" ")[1];
+const verifyToken = (req: AuthRequest, res: Response, next: NextFunction) => {
+  const auth = req.headers.authorization || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+  if (!token) return res.status(401).json({ error: 'No token provided' });
 
   try {
-    const decoded = jwt.verify(token, JWT_SECRET) as any;
+    const decoded = jwt.verify(token, JWT_SECRET) as { id: string; email: string };
     req.user = decoded;
     next();
   } catch {
-    return res.status(401).json({ error: "Invalid token" });
+    return res.status(401).json({ error: 'Invalid token' });
   }
-}
-
-async function requireActiveSubscription(req: any, res: any, next: NextFunction) {
-  const userId = req.user?.id;
-  if (!userId) return res.status(401).json({ error: "Unauthorized" });
-
-  const sub = await db
-    .select()
-    .from(subscriptions)
-    .where(eq(subscriptions.user_id, userId));
-
-  if (sub.length === 0 || sub[0].status !== "active") {
-    return res.status(403).json({ error: "Active subscription required" });
-  }
-
-  next();
-}
+};
 
 /* ================= HEALTH ================= */
 
@@ -95,8 +89,44 @@ app.get('/health', async (_req, res) => {
   try {
     await pool.query('SELECT 1');
     res.json({ status: 'OK' });
-  } catch {
+  } catch (e) {
+    console.error('Health DB error:', e);
     res.status(500).json({ status: 'DB_ERROR' });
+  }
+});
+
+/* ================= DEBUG (PROTECTED) ================= */
+
+app.get('/debug/db-status', verifyToken, async (_req: AuthRequest, res: Response) => {
+  try {
+    // 1) connection + db name
+    const dbNameResult = await pool.query('SELECT current_database() AS name');
+    const database = dbNameResult.rows[0]?.name ?? 'unknown';
+
+    // 2) check key tables exist
+    const existsUsers = await pool.query(
+      `SELECT EXISTS (
+        SELECT 1 FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_name = 'users'
+      ) AS exists`,
+    );
+
+    // 3) basic counts (only if users exists)
+    let counts = { users: 0 };
+    if (existsUsers.rows[0]?.exists === true) {
+      const userCount = await pool.query('SELECT COUNT(*)::int AS count FROM users');
+      counts.users = userCount.rows[0]?.count ?? 0;
+    }
+
+    res.json({
+      connected: true,
+      database,
+      tables: { users_exists: existsUsers.rows[0]?.exists === true },
+      counts,
+    });
+  } catch (err) {
+    console.error('db-status error:', err);
+    res.status(500).json({ connected: false, error: 'DB_STATUS_FAILED' });
   }
 });
 
@@ -133,9 +163,8 @@ app.post('/auth/signup', async (req: Request, res: Response) => {
     });
 
     return res.status(201).json({ message: 'User created' });
-
   } catch (err) {
-    console.error("Signup error:", err);
+    console.error('Signup error:', err);
     return res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -161,113 +190,17 @@ app.post('/auth/login', async (req: Request, res: Response) => {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    const token = jwt.sign(
-      { id: user.id, email: user.email },
-      JWT_SECRET,
-      { expiresIn: '7d' }
-    );
+    const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
 
     return res.json({ token });
-
   } catch (err) {
-    console.error("Login error:", err);
+    console.error('Login error:', err);
     return res.status(500).json({ error: 'Internal server error' });
   }
-});
-
-/* ================= BILLING ================= */
-
-app.post('/billing/create-checkout-session', requireAuth, async (req: any, res: Response) => {
-  try {
-    const userId = req.user.id;
-
-    const session = await stripe.checkout.sessions.create({
-      mode: 'subscription',
-      payment_method_types: ['card'],
-      line_items: [
-        {
-          price: process.env.STRIPE_PRICE_ID!, // ID din Stripe Dashboard
-          quantity: 1,
-        },
-      ],
-      success_url: `${process.env.APP_URL}/success`,
-      cancel_url: `${process.env.APP_URL}/cancel`,
-      metadata: {
-        userId: userId,
-      },
-    });
-
-    return res.json({ url: session.url });
-
-  } catch (err) {
-    console.error("Checkout error:", err);
-    return res.status(500).json({ error: "Unable to create checkout session" });
-  }
-});
-
-/* ================= PREMIUM ROUTE EXAMPLE ================= */
-
-app.get('/books', requireAuth, requireActiveSubscription, async (_req, res) => {
-  try {
-    const allBooks = await db.select().from(books);
-    res.json({ books: allBooks });
-  } catch (err) {
-    console.error("Books error:", err);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-/* ================= STRIPE WEBHOOK ================= */
-
-app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
-  const sig = req.headers['stripe-signature'] as string;
-
-  let event;
-
-  try {
-    event = stripe.webhooks.constructEvent(
-      req.body,
-      sig,
-      process.env.STRIPE_WEBHOOK_SECRET!
-    );
-  } catch (err) {
-    return res.status(400).send('Webhook Error');
-  }
-
-  if (
-    event.type === "customer.subscription.created" ||
-    event.type === "customer.subscription.updated"
-  ) {
-    const subscription = event.data.object as any;
-
-    await db.insert(subscriptions).values({
-      user_id: subscription.metadata.userId,
-      stripe_customer_id: subscription.customer,
-      stripe_subscription_id: subscription.id,
-      status: subscription.status,
-      plan: subscription.items.data[0].price.id,
-    }).onConflictDoUpdate({
-      target: subscriptions.user_id,
-      set: {
-        status: subscription.status,
-        stripe_subscription_id: subscription.id
-      }
-    });
-  }
-
-  if (event.type === "customer.subscription.deleted") {
-    const subscription = event.data.object as any;
-
-    await db.update(subscriptions)
-      .set({ status: "canceled" })
-      .where(eq(subscriptions.stripe_subscription_id, subscription.id));
-  }
-
-  res.json({ received: true });
 });
 
 /* ================= START ================= */
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Production server running on port ${PORT}`);
+  console.log(`🚀 Return API running on port ${PORT}`);
 });
