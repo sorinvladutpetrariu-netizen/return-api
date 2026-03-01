@@ -41,12 +41,6 @@ const stripe =
   STRIPE_SECRET_KEY && STRIPE_SECRET_KEY.startsWith("sk_")
     ? new Stripe(STRIPE_SECRET_KEY, { apiVersion: "2023-10-16" })
     : null;
-console.log(
-  `[Stripe env] mode=${process.env.STRIPE_SECRET_KEY?.startsWith("sk_test_") ? "test" : "live"} ` +
-  `key=${process.env.STRIPE_SECRET_KEY ? "set" : "missing"} ` +
-  `price=${process.env.STRIPE_PRICE_ID ? "set" : "missing"} ` +
-  `webhook=${process.env.STRIPE_WEBHOOK_SECRET ? "set" : "missing"}`
-);
 
 /**
  * DIAGNOSTIC Stripe env (fara sa expunem cheia completa)
@@ -58,13 +52,15 @@ const stripeMode =
     ? "live"
     : STRIPE_SECRET_KEY.startsWith("sk_test_")
       ? "test"
-      : stripe
+      : STRIPE_SECRET_KEY
         ? "unknown"
         : "missing";
 
 const stripeKeyLast4 = STRIPE_SECRET_KEY ? STRIPE_SECRET_KEY.slice(-4) : "----";
 console.log(
-  `[Stripe env] mode=${stripeMode} key=****${stripeKeyLast4} price=${process.env.STRIPE_PRICE_ID ? "set" : "missing"} webhook=${process.env.STRIPE_WEBHOOK_SECRET ? "set" : "missing"}`,
+  `[Stripe env] mode=${stripeMode} key=****${stripeKeyLast4} price=${
+    process.env.STRIPE_PRICE_ID ? "set" : "missing"
+  } webhook=${process.env.STRIPE_WEBHOOK_SECRET ? "set" : "missing"}`,
 );
 
 if (!stripe) {
@@ -80,6 +76,34 @@ app.use(
     origin: true,
     credentials: true,
   }),
+);
+
+// --- Stripe webhook MUST use raw body (place BEFORE express.json) ---
+app.post(
+  "/billing/webhook",
+  express.raw({ type: "application/json" }),
+  (req: Request, res: Response) => {
+    try {
+      if (!stripe) return res.status(503).send("billing disabled");
+
+      const secret = (process.env.STRIPE_WEBHOOK_SECRET || "").trim();
+      if (!secret) return res.status(500).send("missing STRIPE_WEBHOOK_SECRET");
+
+      const sig = req.headers["stripe-signature"];
+      if (!sig || typeof sig !== "string") return res.status(400).send("missing signature");
+
+      const event = stripe.webhooks.constructEvent(req.body, sig, secret);
+
+      // TODO: aici pui logica ta (ex: setezi user premium dupa checkout.session.completed / invoice.paid)
+      // deocamdata doar confirma ca primesti evenimente:
+      console.log("[stripe webhook]", event.type);
+
+      return res.json({ received: true });
+    } catch (err: any) {
+      console.error("Webhook error:", err?.message || err);
+      return res.status(400).send(`Webhook Error: ${err?.message || "unknown"}`);
+    }
+  },
 );
 
 app.use(express.json({ limit: "1mb" }));
