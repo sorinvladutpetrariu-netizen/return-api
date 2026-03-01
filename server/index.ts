@@ -1,51 +1,107 @@
 import bcrypt from 'bcryptjs';
 import cors from 'cors';
-import crypto from 'crypto';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
 import { eq } from 'drizzle-orm';
-import express, { Express, NextFunction, Request, Response } from 'express';
+import express, { Express, Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import Stripe from 'stripe';
 
 import { db, pool } from './db/index';
-import { articles, books, purchases, quotes, users } from './db/schema';
-import { sendPasswordResetEmail, sendVerificationEmail, sendWelcomeEmail } from './gmail-service';
-import { requestIdMiddleware, getRequestId } from './middleware/requestId';
+import { users, subscriptions, books } from './db/schema';
 
 const app: Express = express();
 const PORT = Number(process.env.PORT) || 3000;
 
-// -------------------- ENV VALIDATION --------------------
+/* ================= ENV VALIDATION ================= */
+
 if (!process.env.DATABASE_URL) {
   console.error("❌ DATABASE_URL missing");
+  process.exit(1);
 }
 
 if (!process.env.JWT_SECRET) {
-  console.warn("⚠️ JWT_SECRET missing, using fallback (NOT SAFE FOR PROD)");
+  console.error("❌ JWT_SECRET missing");
+  process.exit(1);
 }
 
-// -------------------- Config --------------------
-const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
+if (!process.env.STRIPE_WEBHOOK_SECRET) {
+  console.warn("⚠️ STRIPE_WEBHOOK_SECRET missing");
+}
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || 'sk_test_placeholder');
+/* ================= CONFIG ================= */
 
-const APP_URL = process.env.APP_URL || `http://localhost:${PORT}`;
+const JWT_SECRET = process.env.JWT_SECRET as string;
 
-// -------------------- Middleware --------------------
-app.use(cors());
-app.use(express.json());
-app.use(requestIdMiddleware);
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '', {
+  apiVersion: '2023-10-16',
+});
 
-// -------------------- Health --------------------
+/* ================= SECURITY ================= */
+
+app.use(helmet());
+
+app.use(cors({
+  origin: true,
+  credentials: true
+}));
+
+app.use(express.json({ limit: '1mb' }));
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 50,
+  message: { error: "Too many requests. Try again later." },
+});
+
+app.use('/auth', authLimiter);
+
+/* ================= AUTH MIDDLEWARE ================= */
+
+function requireAuth(req: any, res: any, next: NextFunction) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: "Unauthorized" });
+
+  const token = authHeader.split(" ")[1];
+
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET) as any;
+    req.user = decoded;
+    next();
+  } catch {
+    return res.status(401).json({ error: "Invalid token" });
+  }
+}
+
+async function requireActiveSubscription(req: any, res: any, next: NextFunction) {
+  const userId = req.user?.id;
+  if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+  const sub = await db
+    .select()
+    .from(subscriptions)
+    .where(eq(subscriptions.user_id, userId));
+
+  if (sub.length === 0 || sub[0].status !== "active") {
+    return res.status(403).json({ error: "Active subscription required" });
+  }
+
+  next();
+}
+
+/* ================= HEALTH ================= */
+
 app.get('/health', async (_req, res) => {
   try {
     await pool.query('SELECT 1');
-    res.json({ status: 'OK', db: 'connected' });
-  } catch (err) {
-    res.status(500).json({ status: 'DB_ERROR', error: (err as any)?.message });
+    res.json({ status: 'OK' });
+  } catch {
+    res.status(500).json({ status: 'DB_ERROR' });
   }
 });
 
-// -------------------- SIGNUP (SAFE VERSION) --------------------
+/* ================= AUTH ================= */
+
 app.post('/auth/signup', async (req: Request, res: Response) => {
   try {
     const email = (req.body?.email || '').trim().toLowerCase();
@@ -57,7 +113,7 @@ app.post('/auth/signup', async (req: Request, res: Response) => {
     }
 
     if (password.length < 8) {
-      return res.status(400).json({ error: 'Password must be at least 8 characters' });
+      return res.status(400).json({ error: 'Password too short' });
     }
 
     const existing = await db.select().from(users).where(eq(users.email, email));
@@ -65,52 +121,32 @@ app.post('/auth/signup', async (req: Request, res: Response) => {
       return res.status(409).json({ error: 'User already exists' });
     }
 
-    const hash = await bcrypt.hash(password, 10);
-    const verificationToken = crypto.randomBytes(32).toString('hex');
-    const userId = `user_${Date.now()}`;
+    const hash = await bcrypt.hash(password, 12);
 
     await db.insert(users).values({
-      id: userId,
+      id: `user_${Date.now()}`,
       email,
       name,
       password_hash: hash,
       email_verified: false,
-      verification_token: verificationToken,
-      verification_token_expires: new Date(Date.now() + 86400000),
       interests: '[]',
     });
 
-    // Gmail optional – nu mai poate provoca 500
-    if (process.env.GMAIL_USER && process.env.GMAIL_PASSWORD) {
-      try {
-        await sendVerificationEmail(email, name, verificationToken, APP_URL);
-      } catch (e) {
-        console.error("Email send failed (non-blocking):", e);
-      }
-    }
+    return res.status(201).json({ message: 'User created' });
 
-    return res.status(201).json({
-      message: 'User created successfully',
-      user: { id: userId, email, name }
-    });
-
-  } catch (error: any) {
-    console.error("SIGNUP ERROR:", error);
-    return res.status(500).json({
-      error: error?.message || "Internal server error",
-      stack: error?.stack
-    });
+  } catch (err) {
+    console.error("Signup error:", err);
+    return res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// -------------------- LOGIN --------------------
 app.post('/auth/login', async (req: Request, res: Response) => {
   try {
     const email = (req.body?.email || '').trim().toLowerCase();
     const password = (req.body?.password || '').trim();
 
     if (!email || !password) {
-      return res.status(400).json({ error: 'Missing email or password' });
+      return res.status(400).json({ error: 'Missing credentials' });
     }
 
     const rows = await db.select().from(users).where(eq(users.email, email));
@@ -125,23 +161,113 @@ app.post('/auth/login', async (req: Request, res: Response) => {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
+    const token = jwt.sign(
+      { id: user.id, email: user.email },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
 
-    return res.json({
-      message: 'Login successful',
-      token
-    });
+    return res.json({ token });
 
-  } catch (error: any) {
-    console.error("LOGIN ERROR:", error);
-    return res.status(500).json({
-      error: error?.message,
-      stack: error?.stack
-    });
+  } catch (err) {
+    console.error("Login error:", err);
+    return res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// -------------------- START --------------------
+/* ================= BILLING ================= */
+
+app.post('/billing/create-checkout-session', requireAuth, async (req: any, res: Response) => {
+  try {
+    const userId = req.user.id;
+
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      payment_method_types: ['card'],
+      line_items: [
+        {
+          price: process.env.STRIPE_PRICE_ID!, // ID din Stripe Dashboard
+          quantity: 1,
+        },
+      ],
+      success_url: `${process.env.APP_URL}/success`,
+      cancel_url: `${process.env.APP_URL}/cancel`,
+      metadata: {
+        userId: userId,
+      },
+    });
+
+    return res.json({ url: session.url });
+
+  } catch (err) {
+    console.error("Checkout error:", err);
+    return res.status(500).json({ error: "Unable to create checkout session" });
+  }
+});
+
+/* ================= PREMIUM ROUTE EXAMPLE ================= */
+
+app.get('/books', requireAuth, requireActiveSubscription, async (_req, res) => {
+  try {
+    const allBooks = await db.select().from(books);
+    res.json({ books: allBooks });
+  } catch (err) {
+    console.error("Books error:", err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/* ================= STRIPE WEBHOOK ================= */
+
+app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'] as string;
+
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      sig,
+      process.env.STRIPE_WEBHOOK_SECRET!
+    );
+  } catch (err) {
+    return res.status(400).send('Webhook Error');
+  }
+
+  if (
+    event.type === "customer.subscription.created" ||
+    event.type === "customer.subscription.updated"
+  ) {
+    const subscription = event.data.object as any;
+
+    await db.insert(subscriptions).values({
+      user_id: subscription.metadata.userId,
+      stripe_customer_id: subscription.customer,
+      stripe_subscription_id: subscription.id,
+      status: subscription.status,
+      plan: subscription.items.data[0].price.id,
+    }).onConflictDoUpdate({
+      target: subscriptions.user_id,
+      set: {
+        status: subscription.status,
+        stripe_subscription_id: subscription.id
+      }
+    });
+  }
+
+  if (event.type === "customer.subscription.deleted") {
+    const subscription = event.data.object as any;
+
+    await db.update(subscriptions)
+      .set({ status: "canceled" })
+      .where(eq(subscriptions.stripe_subscription_id, subscription.id));
+  }
+
+  res.json({ received: true });
+});
+
+/* ================= START ================= */
+
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`🚀 Production server running on port ${PORT}`);
 });
