@@ -3,7 +3,7 @@
   "main": "expo-router/entry",
   "version": "1.0.0",
   "scripts": {
-    "start": "node dist/index.js",
+    "start": "npm run build && node dist/index.js",
     "dev": "npx tsx server/index.ts",
     "build": "esbuild server/index.ts --platform=node --packages=external --bundle --format=esm --outdir=dist",
     "seed": "tsx server/seed.ts",
