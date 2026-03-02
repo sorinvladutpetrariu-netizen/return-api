@@ -19,6 +19,8 @@ export const users = pgTable('users', {
   interests: text('interests').default('[]').notNull(),
   founding_member: boolean('founding_member').default(false).notNull(),
   founding_discount_percent: integer('founding_discount_percent').default(0).notNull(),
+is_premium: boolean('is_premium').default(false).notNull(),
+stripe_customer_id: varchar('stripe_customer_id', { length: 255 }),
 });
 
 // Articles table

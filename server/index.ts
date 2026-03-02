@@ -78,35 +78,110 @@ app.use(
   }),
 );
 
-// --- Stripe webhook MUST use raw body (place BEFORE express.json) ---
-app.post(
-  "/billing/webhook",
-  express.raw({ type: "application/json" }),
-  (req: Request, res: Response) => {
-    try {
-      if (!stripe) return res.status(503).send("billing disabled");
+/* ================= STRIPE WEBHOOK ================= */
+/**
+ * IMPORTANT:
+ * - Stripe webhook MUST use raw body
+ * - MUST be registered BEFORE express.json()
+ */
+app.post("/billing/webhook", express.raw({ type: "application/json" }), (req: Request, res: Response) => {
+  try {
+    if (!stripe) return res.status(503).send("billing disabled");
 
-      const secret = (process.env.STRIPE_WEBHOOK_SECRET || "").trim();
-      if (!secret) return res.status(500).send("missing STRIPE_WEBHOOK_SECRET");
+    const secret = (process.env.STRIPE_WEBHOOK_SECRET || "").trim();
+    if (!secret) return res.status(500).send("missing STRIPE_WEBHOOK_SECRET");
 
-      const sig = req.headers["stripe-signature"];
-      if (!sig || typeof sig !== "string") return res.status(400).send("missing signature");
+    const sig = req.headers["stripe-signature"];
+    if (!sig || typeof sig !== "string") return res.status(400).send("missing signature");
 
-      const event = stripe.webhooks.constructEvent(req.body, sig, secret);
+    // req.body is Buffer because of express.raw()
+    const event = stripe.webhooks.constructEvent(req.body, sig, secret);
 
-      // TODO: aici pui logica ta (ex: setezi user premium dupa checkout.session.completed / invoice.paid)
-      // deocamdata doar confirma ca primesti evenimente:
-      console.log("[stripe webhook]", event.type);
+    // Minimal confirmation + log (safe)
+    console.log("[stripe webhook]", event.type);
+switch (event.type) {
+  case "checkout.session.completed": {
+    const session = event.data.object as Stripe.Checkout.Session;
 
-      return res.json({ received: true });
-    } catch (err: any) {
-      console.error("Webhook error:", err?.message || err);
-      return res.status(400).send(`Webhook Error: ${err?.message || "unknown"}`);
-    }
-  },
-);
+    const customerId =
+      typeof session.customer === "string"
+        ? session.customer
+        : session.customer?.id;
+
+    const userId = (session.metadata?.userId || "").trim();
+    if (!customerId || !userId) break;
+
+    await db
+      .update(users)
+      .set({ stripe_customer_id: customerId })
+      .where(eq(users.id, userId));
+
+    break;
+  }
+
+  case "invoice.paid": {
+    const invoice = event.data.object as Stripe.Invoice;
+
+    const customerId =
+      typeof invoice.customer === "string"
+        ? invoice.customer
+        : invoice.customer?.id;
+
+    if (!customerId) break;
+
+    await db
+      .update(users)
+      .set({ is_premium: true })
+      .where(eq(users.stripe_customer_id, customerId));
+
+    break;
+  }
+
+  case "invoice.payment_failed":
+  case "customer.subscription.deleted": {
+    const obj: any = event.data.object;
+
+    const customerId =
+      typeof obj.customer === "string"
+        ? obj.customer
+        : obj.customer?.id;
+
+    if (!customerId) break;
+
+    await db
+      .update(users)
+      .set({ is_premium: false })
+      .where(eq(users.stripe_customer_id, customerId));
+
+    break;
+  }
+}
+
+    // OPTIONAL (safe stubs) - uncomment when you add business logic:
+    // switch (event.type) {
+    //   case "checkout.session.completed":
+    //     // Mark user premium based on event.data.object (Checkout.Session)
+    //     break;
+    //   case "invoice.paid":
+    //     // Subscription payment succeeded
+    //     break;
+    //   case "customer.subscription.deleted":
+    //     // Subscription canceled
+    //     break;
+    // }
+
+    return res.json({ received: true });
+  } catch (err: any) {
+    console.error("Webhook error:", err?.message || err);
+    return res.status(400).send(`Webhook Error: ${err?.message || "unknown"}`);
+  }
+});
+
+/* ================= BODY PARSER ================= */
 
 app.use(express.json({ limit: "1mb" }));
+
+/* ================= RATE LIMIT ================= */
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
